@@ -5,3 +5,5 @@ vendor/**/*.exe
 vendor/pcsx2/**
 !vendor/pcsx2/.gitkeep
 *.log
+
+build/winfsp.msi

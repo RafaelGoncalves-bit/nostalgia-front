@@ -20,6 +20,47 @@ function fetchJson(url){return new Promise((resolve,reject)=>{const uri=new URL(
 function run(binary,args){return new Promise((resolve,reject)=>execFile(binary,args,{windowsHide:true,timeout:15000,maxBuffer:1024*1024},(err,stdout,stderr)=>err?reject(Error(stderr||err.message)):resolve(stdout)))}
 const rclone=s=>exePath(s.rclonePath,['rclone','rclone.exe']);const pcsx2=s=>exePath(s.pcsx2Path,['pcsx2','pcsx2-qt.exe']);
 const driveExists=d=>fs.existsSync(d+'\\');
+// Dados do PCSX2 separados dos binários instalados em Program Files.
+const pcsx2Data=()=>local('pcsx2-data');
+// Copia BIOS fornecida pelo responsável pelo instalador para o diretório de
+// dados utilizado com -datapath. Não altera arquivos já importados pelo usuário.
+function provisionBundledBios(){
+ const source=vendor('pcsx2','bios');
+ if(!fs.existsSync(source)||!fs.statSync(source).isDirectory())return {copied:0,available:0};
+ const allowed=new Set(['.bin','.rom','.rom1','.rom2','.erom','.nvm','.mec']);
+ const dest=path.join(pcsx2Data(),'bios');
+ let copied=0,available=0;
+ for(const entry of fs.readdirSync(source,{withFileTypes:true})){
+   if(!entry.isFile()||!allowed.has(path.extname(entry.name).toLowerCase()))continue;
+   const input=path.join(source,entry.name);
+   if(fs.statSync(input).size>16*1024*1024)continue;
+   available++;
+   fs.mkdirSync(dest,{recursive:true});
+   const output=path.join(dest,entry.name);
+   if(fs.existsSync(output))continue;
+   try{fs.copyFileSync(input,output,fs.constants.COPYFILE_EXCL);copied++}
+   catch(err){if(err.code!=='EEXIST')throw err}
+ }
+ return {copied,available};
+}
+
+function applyPerformancePreset(){
+ const root=pcsx2Data(),iniDir=path.join(root,'inis'),ini=path.join(iniDir,'PCSX2.ini');
+ fs.mkdirSync(iniDir,{recursive:true});
+ // Ajustes conservadores da configuração base. Preserva configurações já existentes.
+ const previous=fs.existsSync(ini)?fs.readFileSync(ini,'utf8'):'';
+ const existsSection=/^\[EmuCore\/GS\]\s*$/m.test(previous);
+ const initial=existsSection?previous:previous+(previous&&!previous.endsWith('\n')?'\n':'')+'[EmuCore/GS]\n';
+ const settings={UpscaleMultiplier:'1',Renderer:'-1',FXAA:'false',ShadeBoost:'false'};
+ let updated=initial;
+ for(const [key,value] of Object.entries(settings)){
+   const pattern=new RegExp('^'+key+'\\s*=.*$','m');
+   // Só injeta valores na primeira inicialização; nunca altera escolhas posteriores do jogador.
+   if(!fs.existsSync(ini))updated+=`${key} = ${value}\n`;
+ }
+ if(!fs.existsSync(ini))fs.writeFileSync(ini,updated,'utf8');
+ return root;
+}
 async function ensureMount(s){if(driveExists(s.mountDrive))return;if(mounting)throw Error('Montagem já em andamento');if(!checkExec(rclone(s)))throw Error('rclone.exe ausente. Inclua em vendor/rclone ou selecione o executável.');if(!s.password)throw Error('Informe a senha WebDAV nas configurações.');mounting=true;
  try{statusMessage('Conectando ao armazenamento remoto...');const obscured=(await run(rclone(s),['obscure',s.password])).trim();const u=new URL(s.webdavUrl);
  const conf=local('rclone.conf');fs.writeFileSync(conf,`[games]\ntype = webdav\nurl = ${u.href}\nvendor = other\nuser = ${s.user}\npass = ${obscured}\n`,{mode:0o600});
@@ -29,7 +70,21 @@ async function ensureMount(s){if(driveExists(s.mountDrive))return;if(mounting)th
  }finally{mounting=false}}
 function gamePath(s,g){if(!g||!(/^[\w-]+$/.test(g.id))||!g.available)throw Error('Jogo indisponível');const disc=g.discFile;if(typeof disc!=='string'||disc.includes('..')||path.isAbsolute(disc)||!(/^[\w.\/ -]+$/.test(disc)))throw Error('Caminho da ISO inválido');const rel=disc.replace(/\//g,path.sep);return path.join(s.mountDrive+'\\',g.id,rel)}
 async function play(id){const s=load();if(!checkExec(pcsx2(s)))throw Error('PCSX2 não encontrado. Inclua em vendor/pcsx2 ou selecione o executável.');statusMessage('Consultando catálogo...');const catalog=await fetchJson(new URL('/api/games',s.serverUrl).toString());const games=Array.isArray(catalog)?catalog:catalog.games;if(!Array.isArray(games))throw Error('Resposta inválida do catálogo');const g=games.find(x=>x.id===id);if(!g)throw Error('Jogo não encontrado');await ensureMount(s);const file=gamePath(s,g);if(!fs.existsSync(file))throw Error('ISO não encontrada na unidade remota: '+file);
- statusMessage('Abrindo '+g.name+' no PCSX2...');const child=spawn(pcsx2(s),['-fullscreen',file],{detached:false,stdio:'ignore',windowsHide:false});child.once('error',err=>statusMessage('Falha ao iniciar PCSX2: '+err.message));statusMessage('Jogo iniciado: '+g.name);return {ok:true,file}}
+ provisionBundledBios();statusMessage('Abrindo '+g.name+' no PCSX2...');const child=spawn(pcsx2(s),['-datapath',applyPerformancePreset(),'-fullscreen',file],{detached:false,stdio:'ignore',windowsHide:false});child.once('error',err=>statusMessage('Falha ao iniciar PCSX2: '+err.message));statusMessage('Jogo iniciado: '+g.name);return {ok:true,file}}
 function createWindow(){window=new BrowserWindow({width:1160,height:780,minWidth:940,minHeight:640,backgroundColor:'#0b1220',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}});window.webContents.setWindowOpenHandler(()=>({action:'deny'}));if(!app.isPackaged)window.loadURL('http://127.0.0.1:5173');else window.loadFile(path.join(__dirname,'..','dist','index.html'))}
-app.whenReady().then(()=>{ipcMain.handle('settings:get',()=>{const s=load();return {...s,password:''}});ipcMain.handle('settings:save',(_e,v)=>save(v));ipcMain.handle('games:list',()=>fetchJson(new URL('/api/games',load().serverUrl).toString()));ipcMain.handle('system:status',()=>{const s=load();return {pcsx2:checkExec(pcsx2(s)),rclone:checkExec(rclone(s)),mounted:driveExists(s.mountDrive),pcsx2Path:pcsx2(s),rclonePath:rclone(s)}});ipcMain.handle('game:play',(_e,id)=>play(id));ipcMain.handle('binary:pcsx2',async()=>{const r=await dialog.showOpenDialog(window,{title:'Selecione pcsx2-qt.exe',properties:['openFile'],filters:[{name:'Executáveis',extensions:['exe']} ]});return r.canceled?'':r.filePaths[0]});ipcMain.handle('binary:rclone',async()=>{const r=await dialog.showOpenDialog(window,{title:'Selecione rclone.exe',properties:['openFile'],filters:[{name:'Executáveis',extensions:['exe']} ]});return r.canceled?'':r.filePaths[0]});ipcMain.handle('data:open',()=>shell.openPath(dataDir()));ipcMain.handle('bios:import',async()=>{const r=await dialog.showOpenDialog(window,{title:'Selecione sua BIOS extraída do próprio PS2',properties:['openFile'],filters:[{name:'BIOS',extensions:['bin','rom','nvm','mec']} ]});if(r.canceled)return false;const s=load();const dir=path.join(path.dirname(pcsx2(s)),'bios');fs.mkdirSync(dir,{recursive:true});fs.copyFileSync(r.filePaths[0],path.join(dir,path.basename(r.filePaths[0])));return true});createWindow();setTimeout(async()=>{try{const s=load();if(s.autoMount&&s.password&&checkExec(rclone(s)))await ensureMount(s)}catch(e){statusMessage('Montagem automática indisponível: '+e.message)}},1600)});
+app.whenReady().then(()=>{applyPerformancePreset();try{provisionBundledBios()}catch(err){statusMessage('Falha ao preparar BIOS: '+err.message)}ipcMain.handle('settings:get',()=>{const s=load();return {...s,password:''}});ipcMain.handle('settings:save',(_e,v)=>save(v));ipcMain.handle('games:list',()=>fetchJson(new URL('/api/games',load().serverUrl).toString()));ipcMain.handle('system:status',()=>{const s=load();return {pcsx2:checkExec(pcsx2(s)),rclone:checkExec(rclone(s)),mounted:driveExists(s.mountDrive),pcsx2Path:pcsx2(s),rclonePath:rclone(s)}});ipcMain.handle('game:play',(_e,id)=>play(id));ipcMain.handle('binary:pcsx2',async()=>{const r=await dialog.showOpenDialog(window,{title:'Selecione pcsx2-qt.exe',properties:['openFile'],filters:[{name:'Executáveis',extensions:['exe']} ]});return r.canceled?'':r.filePaths[0]});ipcMain.handle('binary:rclone',async()=>{const r=await dialog.showOpenDialog(window,{title:'Selecione rclone.exe',properties:['openFile'],filters:[{name:'Executáveis',extensions:['exe']} ]});return r.canceled?'':r.filePaths[0]});ipcMain.handle('data:open',()=>shell.openPath(dataDir()));ipcMain.handle('bios:import',async()=>{
+ const choice=await dialog.showMessageBox(window,{type:'question',title:'Importar BIOS do seu PS2',message:'Como deseja importar sua BIOS?',detail:'Extraia arquivos .rar/.zip antes da importação. Use apenas arquivos que você tenha autorização para utilizar.',buttons:['Selecionar pasta','Selecionar arquivos','Cancelar'],defaultId:0,cancelId:2});
+ if(choice.response===2)return {count:0,cancelled:true};
+ const isFolder=choice.response===0;
+ const r=await dialog.showOpenDialog(window,{title:'Importar BIOS do seu console',properties:isFolder?['openDirectory']:['openFile','multiSelections'],filters:isFolder?[]:[{name:'Arquivos de BIOS PS2',extensions:['bin','rom','rom1','rom2','erom','nvm','mec']} ]});
+ if(r.canceled)return {count:0,cancelled:true};
+ const allowed=new Set(['.bin','.rom','.rom1','.rom2','.erom','.nvm','.mec']);
+ const sources=isFolder?fs.readdirSync(r.filePaths[0],{withFileTypes:true}).filter(e=>e.isFile()).map(e=>path.join(r.filePaths[0],e.name)):r.filePaths;
+ const valid=sources.filter(src=>allowed.has(path.extname(src).toLowerCase())&&fs.statSync(src).size<=16*1024*1024);
+ if(!valid.length)throw Error('Nenhum arquivo de BIOS compatível encontrado. Extraia o RAR e selecione a pasta extraída.');
+ const s=load();const dest=path.join(pcsx2Data(),'bios');fs.mkdirSync(dest,{recursive:true});
+ let count=0;for(const src of valid){const out=path.join(dest,path.basename(src));if(path.resolve(src)===path.resolve(out))continue;if(fs.existsSync(out))continue;fs.copyFileSync(src,out,fs.constants.COPYFILE_EXCL);count++}
+ statusMessage(`${count} arquivo(s) de BIOS importado(s). Se necessário, selecione a BIOS no PCSX2.`);
+ return {count,total:valid.length,directory:dest};
+});createWindow();setTimeout(async()=>{try{const s=load();if(s.autoMount&&s.password&&checkExec(rclone(s)))await ensureMount(s)}catch(e){statusMessage('Montagem automática indisponível: '+e.message)}},1600)});
 app.on('before-quit',()=>{if(mountProcess&&!mountProcess.killed)mountProcess.kill()});app.on('window-all-closed',()=>app.quit());
