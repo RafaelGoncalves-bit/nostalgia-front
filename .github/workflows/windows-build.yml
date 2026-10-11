@@ -12,6 +12,12 @@ jobs:
         with:
           node-version: 22
       - run: npm install
+      - run: npm run check
+      - name: Check bundled binaries
+        shell: pwsh
+        run: |
+          if (!(Test-Path vendor/pcsx2/pcsx2-qt.exe)) { throw "PCSX2 portatil ausente em vendor/pcsx2" }
+          if (!(Test-Path vendor/rclone/rclone.exe)) { throw "rclone ausente em vendor/rclone" }
       - run: npm run dist:win
       - uses: actions/upload-artifact@v4
         with:
